@@ -34,6 +34,7 @@ impl Dataset for Prices {
     fn column_types(&self) -> HashMap<&'static str, ColumnType> {
         // Note that the prices
         HashMap::from_iter(vec![
+            ("block_number", ColumnType::UInt32),
             ("weth_wbtc", ColumnType::Float64),
             ("weth_usdc", ColumnType::Float64),
             ("weth_dai", ColumnType::Float64),
@@ -42,11 +43,12 @@ impl Dataset for Prices {
     }
 
     fn default_columns(&self) -> Vec<&'static str> {
-        vec!["weth_wbtc", "weth_usdc", "weth_dai", "weth_usdt"]
+        vec!["block_number", "weth_wbtc", "weth_usdc", "weth_dai", "weth_usdt"]
     }
 
     fn default_sort(&self) -> Vec<String> {
         vec![
+            "block_number".to_string(),
             "weth_wbtc".to_string(),
             "weth_usdc".to_string(),
             "weth_dai".to_string(),
@@ -69,7 +71,7 @@ impl Dataset for Prices {
 async fn fetch_prices(
     block_chunk: &BlockChunk,
     source: &Source,
-) -> mpsc::Receiver<Result<WbtcUsdcDaiUsdt, CollectError>> {
+) -> mpsc::Receiver<Result<BlockWbtcUsdcDaiUsdt, CollectError>> {
     let (tx, rx) = mpsc::channel(block_chunk.numbers().len());
 
     for number in block_chunk.numbers() {
@@ -100,7 +102,7 @@ async fn fetch_prices(
                     let weth_usdc = format_ether(price_res[1]).parse::<f64>().unwrap();
                     let weth_dai = format_ether(price_res[2]).parse::<f64>().unwrap();
                     let weth_usdt = format_ether(price_res[3]).parse::<f64>().unwrap();
-                    Ok((weth_wbtc, weth_usdc, weth_dai, weth_usdt))
+                    Ok((number as u32, weth_wbtc, weth_usdc, weth_dai, weth_usdt))
                 }
                 Err(e) => Err(e),
             };
@@ -119,7 +121,7 @@ async fn fetch_prices(
 }
 
 async fn prices_to_df(
-    mut prices: mpsc::Receiver<Result<WbtcUsdcDaiUsdt, CollectError>>,
+    mut prices: mpsc::Receiver<Result<BlockWbtcUsdcDaiUsdt, CollectError>>,
     schema: &Table,
     chain_id: u64,
 ) -> Result<DataFrame, CollectError> {
@@ -139,11 +141,12 @@ async fn prices_to_df(
     columns.create_df(schema, chain_id)
 }
 
-pub(crate) type WbtcUsdcDaiUsdt = (f64, f64, f64, f64);
+pub(crate) type BlockWbtcUsdcDaiUsdt = (u32, f64, f64, f64, f64);
 
 #[derive(Default)]
 struct PricesColumns {
     n_rows: usize,
+    block_number: Vec<u32>,
     weth_wbtc: Vec<f64>,
     weth_usdc: Vec<f64>,
     weth_dai: Vec<f64>,
@@ -151,9 +154,12 @@ struct PricesColumns {
 }
 
 impl PricesColumns {
-    fn process_price(&mut self, prices: WbtcUsdcDaiUsdt, schema: &Table) {
-        let (weth_wbtc, weth_usdc, weth_dai, weth_usdt) = prices;
+    fn process_price(&mut self, prices: BlockWbtcUsdcDaiUsdt, schema: &Table) {
+        let (block_number, weth_wbtc, weth_usdc, weth_dai, weth_usdt) = prices;
         self.n_rows += 1;
+        if schema.has_column("block_number") {
+            self.block_number.push(block_number);
+        }
         if schema.has_column("weth_wbtc") {
             self.weth_wbtc.push(weth_wbtc);
         }
@@ -170,6 +176,7 @@ impl PricesColumns {
 
     fn create_df(self, schema: &Table, _chain_id: u64) -> Result<DataFrame, CollectError> {
         let mut cols = Vec::with_capacity(schema.columns().len());
+        with_series!(cols, "block_number", self.block_number, schema);
         with_series!(cols, "weth_wbtc", self.weth_wbtc, schema);
         with_series!(cols, "weth_usdc", self.weth_usdc, schema);
         with_series!(cols, "weth_dai", self.weth_dai, schema);
