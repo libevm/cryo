@@ -56,6 +56,8 @@ pub struct TransactionAddresses;
 pub struct VmTraces;
 /// Native Transfers Dataset
 pub struct NativeTransfers;
+/// Prices Dataset
+pub struct Prices;
 
 /// enum of possible datatypes that cryo can collect
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -108,6 +110,8 @@ pub enum Datatype {
     VmTraces,
     /// Native Transfers
     NativeTransfers,
+    /// Prices
+    Prices
 }
 
 impl Datatype {
@@ -138,6 +142,7 @@ impl Datatype {
             Datatype::TransactionAddresses => Box::new(TransactionAddresses),
             Datatype::VmTraces => Box::new(VmTraces),
             Datatype::NativeTransfers => Box::new(NativeTransfers),
+            Datatype::Prices => Box::new(Prices)
         }
     }
 }

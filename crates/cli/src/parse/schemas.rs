@@ -38,6 +38,7 @@ fn parse_datatypes(raw_inputs: &Vec<String>) -> Result<Vec<Datatype>, ParseError
                     "nonce_diffs" => Datatype::NonceDiffs,
                     "nonces" => Datatype::Nonces,
                     "opcode_traces" => Datatype::VmTraces,
+                    "prices" => Datatype::Prices,
                     "storage_diffs" => Datatype::StorageDiffs,
                     "storages" => Datatype::Storages,
                     "trace_calls" => Datatype::TraceCalls,
