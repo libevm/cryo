@@ -1,87 +1,93 @@
+use crate::{args, parse, remember};
+use clap_cryo::Parser;
+use color_print::cstr;
+use colored::Colorize;
+use cryo_freeze::{CollectError, ExecutionEnv, FreezeSummary};
 use std::{sync::Arc, time::SystemTime};
 
-use crate::{args, parse, summaries};
-use cryo_freeze::{FreezeError, FreezeSummary};
-use indicatif::ProgressBar;
+/// run cli
+pub async fn run(args: args::Args) -> Result<Option<FreezeSummary>, CollectError> {
+    // handle subcommands
+    if args.datatype.first() == Some(&"help".to_string()) {
+        return handle_help_subcommands(args).await
+    }
 
-/// run freeze for given Args
-pub async fn run(args: args::Args) -> Result<Option<FreezeSummary>, FreezeError> {
-    // parse inputs
-    let t_start = SystemTime::now();
-    let (query, source, sink) = match parse::parse_opts(&args).await {
+    // remember previous command
+    let args = if args.datatype.is_empty() {
+        let remembered = remember::load_remembered_command(args.output_dir.clone().into())?;
+        if remembered.cryo_version != cryo_freeze::CRYO_VERSION {
+            eprintln!("remembered command comes from different cryo version, proceed with caution");
+            eprintln!();
+        };
+        println!(
+            "{} {} {}",
+            "remembering previous command:".truecolor(170, 170, 170),
+            "cryo".bold().white(),
+            remembered.command.into_iter().skip(1).collect::<Vec<_>>().join(" ").white().bold()
+        );
+        println!();
+        args.merge_with_precedence(remembered.args)
+    } else {
+        args
+    };
+
+    // remember current command
+    if args.remember {
+        println!("remembering this command for future use");
+        println!();
+        remember::save_remembered_command(args.output_dir.clone().into(), &args)?;
+    }
+
+    // handle regular flow
+    let t_start_parse = Some(SystemTime::now());
+    let (query, source, sink, env) = match parse::parse_args(&args).await {
         Ok(opts) => opts,
         Err(e) => return Err(e.into()),
     };
-    let t_parse_done = SystemTime::now();
 
-    let n_chunks_remaining = query.get_n_chunks_remaining(&sink)?;
+    let source = Arc::new(source);
+    let env = ExecutionEnv { t_start_parse, ..env };
+    let env = env.set_start_time();
+    cryo_freeze::freeze(&query, &source, &sink, &env).await
+}
 
-    // print summary
-    if !args.no_verbose {
-        let report_path = if !args.no_report && n_chunks_remaining > 0 {
-            let report_path = crate::reports::get_report_path(&args, t_start, true)?;
-            Some(report_path.strip_prefix("./").unwrap_or(&report_path).to_string())
-        } else {
-            None
-        };
-        summaries::print_cryo_summary(&query, &source, &sink, n_chunks_remaining, report_path);
-    }
+async fn handle_help_subcommands(args: args::Args) -> Result<Option<FreezeSummary>, CollectError> {
+    if args.datatype.len() == 1 {
+        args::Args::parse_from(vec!["cryo", "-h"]);
+    } else if args.datatype.len() == 2 && args.datatype[1] == "syntax" {
+        let content = cstr!(
+            r#"<white><bold>Block specification syntax</bold></white>
+- can use numbers                    <white><bold>--blocks 5000 6000 7000</bold></white>
+- can use ranges                     <white><bold>--blocks 12M:13M 15M:16M</bold></white>
+- can use a parquet file             <white><bold>--blocks ./path/to/file.parquet[:COLUMN_NAME]</bold></white>
+- can use multiple parquet files     <white><bold>--blocks ./path/to/files/*.parquet[:COLUMN_NAME]</bold></white>
+- numbers can contain { _ . K M B }  <white><bold>5_000 5K 15M 15.5M</bold></white>
+- omitting range end means latest    <white><bold>15.5M:</bold></white> == <white><bold>15.5M:latest</bold></white>
+- omitting range start means 0       <white><bold>:700</bold></white> == <white><bold>0:700</bold></white>
+- minus on start means minus end     <white><bold>-1000:7000</bold></white> == <white><bold>6000:7000</bold></white>
+- plus sign on end means plus start  <white><bold>15M:+1000</bold></white> == <white><bold>15M:15.001K</bold></white>
+- can use every nth value            <white><bold>2000:5000:1000</bold></white> == <white><bold>2000 3000 4000</bold></white>
+- can use n values total             <white><bold>100:200/5</bold></white> == <white><bold>100 124 149 174 199</bold></white>
 
-    // check dry run
-    if args.dry {
-        if !args.no_verbose {
-            println!("\n\n[dry run, exiting]");
-        }
-        return Ok(None)
-    };
-
-    // create initial report
-    if !args.no_report && n_chunks_remaining > 0 {
-        crate::reports::write_report(&args, None, t_start)?;
-    };
-
-    // create progress bar
-    let bar = Arc::new(ProgressBar::new(n_chunks_remaining));
-    bar.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("{wide_bar:.green} {human_pos} / {human_len}   ETA={eta_precise} ")
-            .map_err(FreezeError::ProgressBarError)?,
-    );
-
-    // collect data
-    if !args.no_verbose {
-        summaries::print_header("\n\ncollecting data");
-    }
-    match cryo_freeze::freeze(&query, &source, &sink, bar).await {
-        Ok(freeze_summary) => {
-            // print summary
-            let t_data_done = SystemTime::now();
-            if !args.no_verbose {
-                println!("...done\n\n");
-                summaries::print_cryo_conclusion(
-                    t_start,
-                    t_parse_done,
-                    t_data_done,
-                    &query,
-                    &freeze_summary,
-                )
+<white><bold>Transaction specification syntax</bold></white>
+- can use transaction hashes         <white><bold>--txs TX_HASH1 TX_HASH2 TX_HASH3</bold></white>
+- can use a parquet file             <white><bold>--txs ./path/to/file.parquet[:COLUMN_NAME]</bold></white>
+                                     (default column name is <white><bold>transaction_hash</bold></white>)
+- can use multiple parquet files     <white><bold>--txs ./path/to/ethereum__logs*.parquet</bold></white>"#
+        );
+        println!("{}", content);
+    } else if args.datatype.len() == 2 && args.datatype.contains(&"datasets".to_string()) {
+        cryo_freeze::print_all_datasets();
+    } else {
+        let args = args::Args { datatype: args.datatype[1..].to_vec(), ..args };
+        let schemas = super::parse::schemas::parse_schemas(&args)?;
+        for (datatype, schema) in schemas.iter() {
+            if schemas.len() > 1 {
+                println!();
+                println!();
             }
-
-            let n_attempts = freeze_summary.n_completed + freeze_summary.n_errored;
-            if !args.no_report && n_attempts > 0 {
-                crate::reports::write_report(&args, Some(&freeze_summary), t_start)?;
-                let incomplete_report_path =
-                    crate::reports::get_report_path(&args, t_start, false)?;
-                std::fs::remove_file(incomplete_report_path)?;
-            };
-
-            // return summary
-            Ok(Some(freeze_summary))
-        }
-
-        Err(e) => {
-            println!("{}", e);
-            Err(e)
+            cryo_freeze::print_dataset_info(*datatype, schema);
         }
     }
+    Ok(None)
 }

@@ -1,13 +1,25 @@
 use clap_cryo::Parser;
 use color_print::cstr;
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{default::Default, path::PathBuf};
 
 /// Command line arguments
-#[derive(Parser, Debug, Serialize, Deserialize)]
-#[command(name = "cryo", author, version, about = get_about_str(), long_about = None, styles=get_styles(), after_help=get_after_str(), allow_negative_numbers = true)]
+#[derive(Parser, Debug, Serialize, Deserialize, Clone, Default)]
+#[command(
+    name = "cryo",
+    author,
+    version = cryo_freeze::CRYO_VERSION,
+    about = &get_about_str(),
+    long_about = None,
+    styles=get_styles(),
+    after_help=&get_after_str(),
+    allow_negative_numbers = true,
+)]
 pub struct Args {
-    /// datatype to collect
-    #[arg(required = true, help=get_datatype_help(), num_args(1..))]
+    /// Datatype to collect
+    #[arg(help=get_datatype_help(), num_args(0..))]
     pub datatype: Vec<String>,
 
     /// Block numbers, see syntax below
@@ -44,11 +56,11 @@ pub struct Args {
     #[arg(short, long, value_name="COLS", num_args(0..), verbatim_doc_comment, help_heading="Content Options")]
     pub include_columns: Option<Vec<String>>,
 
-    /// Columns to exclude from the default output
+    /// Columns to exclude from the defaults
     #[arg(short, long, value_name="COLS", num_args(0..), help_heading="Content Options")]
     pub exclude_columns: Option<Vec<String>>,
 
-    /// Columns to use instead of the default columns,
+    /// Columns to use instead of the defaults,
     /// use `all` to use all available columns
     #[arg(long, value_name="COLS", num_args(0..), verbatim_doc_comment, help_heading="Content Options")]
     pub columns: Option<Vec<String>>,
@@ -78,11 +90,11 @@ pub struct Args {
     #[arg(short('l'), long, value_name = "limit", help_heading = "Acquisition Options")]
     pub requests_per_second: Option<u32>,
 
-    /// Specify max retries on provider errors
+    /// Max retries for provider errors
     #[arg(long, default_value_t = 5, value_name = "R", help_heading = "Acquisition Options")]
     pub max_retries: u32,
 
-    /// Specify initial backoff for retry strategy (ms)
+    /// Initial retry backoff time (ms)
     #[arg(long, default_value_t = 500, value_name = "B", help_heading = "Acquisition Options")]
     pub initial_backoff: u64,
 
@@ -98,6 +110,14 @@ pub struct Args {
     #[arg(short, long, help_heading = "Acquisition Options")]
     pub dry: bool,
 
+    /// Remember current command for future use
+    #[arg(long)]
+    pub remember: bool,
+
+    /// Extra verbosity
+    #[arg(short, long)]
+    pub verbose: bool,
+
     /// Run quietly without printing information to stdout
     #[arg(long)]
     pub no_verbose: bool,
@@ -110,12 +130,21 @@ pub struct Args {
     #[arg(long, help_heading = "Output Options")]
     pub n_chunks: Option<u64>,
 
+    /// Dimensions to partition by
+    #[arg(long, help_heading = "Output Options")]
+    pub partition_by: Option<Vec<String>>,
+
     /// Directory for output files
     #[arg(short, long, default_value = ".", help_heading = "Output Options")]
     pub output_dir: String,
 
+    /// Subdirectories for output files
+    /// can be `datatype`, `network`, or custom string
+    #[arg(long, help_heading = "Output Options", verbatim_doc_comment, num_args(1..))]
+    pub subdirs: Vec<String>,
+
     /// Suffix to attach to end of each filename
-    #[arg(long, help_heading = "Output Options")]
+    #[arg(long, help_heading = "Output Options", hide = true)]
     pub file_suffix: Option<String>,
 
     /// Overwrite existing files instead of skipping
@@ -149,72 +178,96 @@ pub struct Args {
     /// Directory to save summary report
     /// [default: {output_dir}/.cryo/reports]
     #[arg(long, help_heading = "Output Options", verbatim_doc_comment)]
-    pub report_dir: Option<String>,
+    pub report_dir: Option<PathBuf>,
 
     /// Avoid saving a summary report
     #[arg(long, help_heading = "Output Options")]
     pub no_report: bool,
 
-    /// Address
+    /// Address(es)
     #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
     pub address: Option<Vec<String>>,
 
-    /// To Address
-    #[arg(long, help_heading = "Dataset-specific Options", num_args(1..), value_name="TO")]
+    /// To Address(es)
+    #[arg(long, help_heading = "Dataset-specific Options", value_name="address", num_args(1..))]
     pub to_address: Option<Vec<String>>,
 
-    /// From Address
-    #[arg(long, help_heading = "Dataset-specific Options", num_args(1..), value_name="FROM")]
+    /// From Address(es)
+    #[arg(long, help_heading = "Dataset-specific Options", value_name="address", num_args(1..))]
     pub from_address: Option<Vec<String>>,
 
-    /// [eth_calls] Call data to use for eth_calls
+    /// Call data(s) to use for eth_calls
     #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
     pub call_data: Option<Vec<String>>,
 
-    /// [eth_calls] Function to use for eth_calls
+    /// Function(s) to use for eth_calls
     #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
     pub function: Option<Vec<String>>,
 
-    /// [eth_calls] Inputs to use for eth_calls
+    /// Input(s) to use for eth_calls
     #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
     pub inputs: Option<Vec<String>>,
 
-    /// [slots] Slots
+    /// Slot(s)
     #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
-    pub slots: Option<Vec<String>>,
+    pub slot: Option<Vec<String>>,
 
-    /// [logs] filter logs by contract address
-    #[arg(long, help_heading = "Dataset-specific Options")]
+    /// Contract address(es)
+    #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
     pub contract: Option<Vec<String>>,
 
-    /// [logs] filter logs by topic0
-    #[arg(long, visible_alias = "event", help_heading = "Dataset-specific Options")]
-    pub topic0: Option<String>,
+    /// Topic0(s)
+    #[arg(long, visible_alias = "event", help_heading = "Dataset-specific Options", num_args(1..))]
+    pub topic0: Option<Vec<String>>,
 
-    /// [logs] filter logs by topic1
-    #[arg(long, help_heading = "Dataset-specific Options")]
-    pub topic1: Option<String>,
+    /// Topic1(s)
+    #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
+    pub topic1: Option<Vec<String>>,
 
-    /// [logs] filter logs by topic2
-    #[arg(long, help_heading = "Dataset-specific Options")]
-    pub topic2: Option<String>,
+    /// Topic2(s)
+    #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
+    pub topic2: Option<Vec<String>>,
 
-    /// [logs] filter logs by topic3
-    #[arg(long, help_heading = "Dataset-specific Options")]
-    pub topic3: Option<String>,
+    /// Topic3(s)
+    #[arg(long, help_heading = "Dataset-specific Options", num_args(1..))]
+    pub topic3: Option<Vec<String>>,
 
-    /// [logs] Blocks per request
+    /// Event signature for log decoding
+    #[arg(long, value_name = "SIG", help_heading = "Dataset-specific Options", num_args(1..))]
+    pub event_signature: Option<String>,
+
+    /// Blocks per request (eth_getLogs)
     #[arg(
         long,
-        value_name = "SIZE",
+        value_name = "BLOCKS",
         default_value_t = 1,
         help_heading = "Dataset-specific Options"
     )]
     pub inner_request_size: u64,
+}
 
-    /// [logs] event signature to parse
-    #[arg(long, value_name = "SIGNATURE", help_heading = "Dataset-specific Options")]
-    pub event_signature: Option<String>,
+impl Args {
+    pub(crate) fn merge_with_precedence(self, other: Args) -> Self {
+        let default_struct = Args::default();
+
+        let mut s1_value: Value = serde_json::to_value(&self).expect("Failed to serialize to JSON");
+        let s2_value: Value = serde_json::to_value(&other).expect("Failed to serialize to JSON");
+        let default_value: Value =
+            serde_json::to_value(&default_struct).expect("Failed to serialize to JSON");
+
+        if let (Value::Object(s1_map), Value::Object(s2_map), Value::Object(default_map)) =
+            (&mut s1_value, &s2_value, &default_value)
+        {
+            for (k, v) in s2_map.iter() {
+                // If the value in s2 is different from the default, overwrite the value in s1
+                if default_map.get(k) != Some(v) {
+                    s1_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        serde_json::from_value(s1_value).expect("Failed to deserialize from JSON")
+    }
 }
 
 pub(crate) fn get_styles() -> clap_cryo::builder::Styles {
@@ -234,44 +287,26 @@ pub(crate) fn get_styles() -> clap_cryo::builder::Styles {
         .invalid(comment)
 }
 
-fn get_about_str() -> &'static str {
+fn get_about_str() -> String {
     cstr!(r#"<white><bold>cryo</bold></white> extracts blockchain data to parquet, csv, or json"#)
+        .to_string()
 }
 
-fn get_after_str() -> &'static str {
-    cstr!(
+fn get_after_str() -> String {
+    let header = "Optional Subcommands:".truecolor(0, 225, 0).bold().to_string();
+    let subcommands = cstr!(
         r#"
-<white><bold>Block specification syntax</bold></white>
-- can use numbers                    <white><bold>--blocks 5000 6000 7000</bold></white>
-- can use ranges                     <white><bold>--blocks 12M:13M 15M:16M</bold></white>
-- numbers can contain { _ . K M B }  <white><bold>5_000 5K 15M 15.5M</bold></white>
-- omiting range end means latest     <white><bold>15.5M:</bold></white> == <white><bold>15.5M:latest</bold></white>
-- omitting range start means 0       <white><bold>:700</bold></white> == <white><bold>0:700</bold></white>
-- minus on start means minus end     <white><bold>-1000:7000</bold></white> == <white><bold>6000:7000</bold></white>
-- plus sign on end means plus start  <white><bold>15M:+1000</bold></white> == <white><bold>15M:15.001K</bold></white>
-
-<white><bold>Transaction hash specification syntax</bold></white>
-- can use transaction hashes         <white><bold>--txs TX_HASH1 TX_HASH2 TX_HASH3</bold></white>
-- can use a parquet file             <white><bold>--txs ./path/to/file.parquet[:COLUMN_NAME]</bold></white>
-                                     (default column name is <white><bold>transaction_hash</bold></white>)
-- can use multiple parquet files     <white><bold>--txs ./path/to/ethereum__logs*.parquet</bold></white>
-"#
-    )
+      <white><bold>cryo help</bold></white>                      display help message
+      <white><bold>cryo help syntax</bold></white>               display block + tx specification syntax
+      <white><bold>cryo help datasets</bold></white>             display list of all datasets
+      <white><bold>cryo help</bold></white>"#
+    );
+    let post_subcommands = " <DATASET(S)>         display info about a dataset";
+    format!("{}{}{}", header, subcommands, post_subcommands)
 }
 
 fn get_datatype_help() -> &'static str {
     cstr!(
-        r#"datatype(s) to collect, one or more of:
-- <white><bold>blocks</bold></white>
-- <white><bold>transactions</bold></white>  (alias = <white><bold>txs</bold></white>)
-- <white><bold>logs</bold></white>          (alias = <white><bold>events</bold></white>)
-- <white><bold>contracts</bold></white>
-- <white><bold>traces</bold></white>        (alias = <white><bold>call_traces</bold></white>)
-- <white><bold>state_diffs</bold></white>   (= balance + code + nonce + storage diffs)
-- <white><bold>balance_diffs</bold></white>
-- <white><bold>code_diffs</bold></white>
-- <white><bold>nonce_diffs</bold></white>
-- <white><bold>storage_diffs</bold></white>
-- <white><bold>vm_traces</bold></white>     (alias = <white><bold>opcode_traces</bold></white>)"#
+        r#"datatype(s) to collect, use <white><bold>cryo datasets</bold></white> to see all available"#
     )
 }
