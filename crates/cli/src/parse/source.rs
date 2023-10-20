@@ -5,7 +5,7 @@ use governor::{Quota, RateLimiter};
 use polars::prelude::*;
 use std::num::NonZeroU32;
 
-use cryo_freeze::{Fetcher, ParseError, Source};
+use cryo_freeze::{Fetcher, ParseError, Source, SourceLabels};
 
 use crate::args::Args;
 
@@ -18,9 +18,9 @@ pub(crate) async fn parse_source(args: &Args) -> Result<Source, ParseError> {
     let chain_id = provider.get_chainid().await.map_err(ParseError::ProviderError)?.as_u64();
 
     let rate_limiter = match args.requests_per_second {
-        Some(rate_limit) => match NonZeroU32::new(rate_limit) {
-            Some(value) => {
-                let quota = Quota::per_second(value);
+        Some(rate_limit) => match (NonZeroU32::new(1), NonZeroU32::new(rate_limit)) {
+            (Some(one), Some(value)) => {
+                let quota = Quota::per_second(value).allow_burst(one);
                 Some(RateLimiter::direct(quota))
             }
             _ => None,
@@ -30,7 +30,11 @@ pub(crate) async fn parse_source(args: &Args) -> Result<Source, ParseError> {
 
     // process concurrency info
     let max_concurrent_requests = args.max_concurrent_requests.unwrap_or(100);
-    let max_concurrent_chunks = args.max_concurrent_chunks.unwrap_or(3);
+    let max_concurrent_chunks = match args.max_concurrent_chunks {
+        Some(0) => None,
+        Some(max) => Some(max),
+        None => Some(4),
+    };
 
     let semaphore = tokio::sync::Semaphore::new(max_concurrent_requests as usize);
     let semaphore = Some(semaphore);
@@ -41,6 +45,13 @@ pub(crate) async fn parse_source(args: &Args) -> Result<Source, ParseError> {
         chain_id,
         inner_request_size: args.inner_request_size,
         max_concurrent_chunks,
+        rpc_url,
+        labels: SourceLabels {
+            max_concurrent_requests: args.requests_per_second.map(|x| x as u64),
+            max_requests_per_second: args.requests_per_second.map(|x| x as u64),
+            max_retries: Some(args.max_retries),
+            initial_backoff: Some(args.initial_backoff),
+        },
     };
 
     Ok(output)

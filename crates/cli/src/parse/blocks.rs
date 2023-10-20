@@ -2,20 +2,21 @@ use ethers::prelude::*;
 use polars::prelude::*;
 use std::collections::HashMap;
 
-use cryo_freeze::{BlockChunk, Chunk, ChunkData, Datatype, Fetcher, ParseError, Subchunk, Table};
+use cryo_freeze::{BlockChunk, ChunkData, Datatype, Fetcher, ParseError, Subchunk, Table};
 
 use crate::args::Args;
 
 pub(crate) async fn parse_blocks<P: JsonRpcClient>(
     args: &Args,
     fetcher: Arc<Fetcher<P>>,
-) -> Result<Vec<(Chunk, Option<String>)>, ParseError> {
+) -> Result<(Option<Vec<Option<String>>>, Option<Vec<BlockChunk>>), ParseError> {
     let (files, explicit_numbers): (Vec<&String>, Vec<&String>) = match &args.blocks {
         Some(blocks) => blocks.iter().partition(|tx| std::path::Path::new(tx).exists()),
-        None => return Err(ParseError::ParseError("no blocks specified".to_string())),
+        None => return Ok((None, None)),
     };
 
-    let mut file_chunks = if !files.is_empty() {
+    let (file_labels, file_chunks) = if !files.is_empty() {
+        let mut file_labels = Vec::new();
         let mut file_chunks = Vec::new();
         for path in files {
             let column = if path.contains(':') {
@@ -32,11 +33,12 @@ pub(crate) async fn parse_blocks<P: JsonRpcClient>(
                 .split("__")
                 .last()
                 .and_then(|s| s.strip_suffix(".parquet").map(|s| s.to_string()));
-            file_chunks.push((Chunk::Block(chunk), chunk_label));
+            file_labels.push(chunk_label);
+            file_chunks.push(chunk);
         }
-        file_chunks
+        (Some(file_labels), Some(file_chunks))
     } else {
-        Vec::new()
+        (None, None)
     };
 
     let explicit_chunks = if !explicit_numbers.is_empty() {
@@ -51,8 +53,19 @@ pub(crate) async fn parse_blocks<P: JsonRpcClient>(
         Vec::new()
     };
 
-    file_chunks.extend(explicit_chunks);
-    Ok(file_chunks)
+    let mut block_chunks = Vec::new();
+    let labels = match (file_labels, file_chunks) {
+        (Some(file_labels), Some(file_chunks)) => {
+            let mut labels = Vec::new();
+            labels.extend(file_labels);
+            block_chunks.extend(file_chunks);
+            labels.extend(vec![None; explicit_chunks.len()]);
+            Some(labels)
+        }
+        _ => None,
+    };
+    block_chunks.extend(explicit_chunks);
+    Ok((labels, Some(block_chunks)))
 }
 
 fn read_integer_column(path: &str, column: &str) -> Result<Vec<u64>, ParseError> {
@@ -97,7 +110,7 @@ async fn postprocess_block_chunks<P: JsonRpcClient>(
     block_chunks: Vec<BlockChunk>,
     args: &Args,
     fetcher: Arc<Fetcher<P>>,
-) -> Result<Vec<(Chunk, Option<String>)>, ParseError> {
+) -> Result<Vec<BlockChunk>, ParseError> {
     // align
     let block_chunks = if args.align {
         block_chunks.into_iter().filter_map(|x| x.align(args.chunk_size)).collect()
@@ -114,24 +127,22 @@ async fn postprocess_block_chunks<P: JsonRpcClient>(
     // apply reorg buffer
     let block_chunks = apply_reorg_buffer(block_chunks, args.reorg_buffer, &fetcher).await?;
 
-    // put into Chunk enums
-    let chunks: Vec<(Chunk, Option<String>)> =
-        block_chunks.iter().map(|x| (Chunk::Block(x.clone()), None)).collect();
-
-    Ok(chunks)
+    Ok(block_chunks)
 }
 
 pub(crate) async fn get_default_block_chunks<P: JsonRpcClient>(
     args: &Args,
     fetcher: Arc<Fetcher<P>>,
     schemas: &HashMap<Datatype, Table>,
-) -> Result<Vec<(Chunk, Option<String>)>, ParseError> {
-    let default_blocks = schemas
+) -> Result<Vec<BlockChunk>, ParseError> {
+    let default_blocks = match schemas
         .keys()
-        .map(|datatype| datatype.dataset().default_blocks())
+        .map(|datatype| datatype.default_blocks())
         .find(|blocks| !blocks.is_none())
-        .unwrap_or(Some("0:latest".to_string()))
-        .unwrap();
+    {
+        Some(Some(blocks)) => blocks,
+        _ => "0:latest".to_string(),
+    };
     let block_chunks = parse_block_inputs(&default_blocks, &fetcher).await?;
     postprocess_block_chunks(block_chunks, args, fetcher).await
 }
@@ -179,52 +190,136 @@ async fn parse_block_token<P: JsonRpcClient>(
             Ok(BlockChunk::Numbers(vec![block]))
         }
         [first_ref, second_ref] => {
-            let (start_block, end_block) = match (first_ref, second_ref) {
-                _ if first_ref.starts_with('-') => {
-                    let end_block =
-                        parse_block_number(second_ref, RangePosition::Last, fetcher).await?;
-                    let start_block = end_block
-                        .checked_sub(first_ref[1..].parse::<u64>().map_err(|_e| {
-                            ParseError::ParseError("start_block parse error".to_string())
-                        })?)
-                        .ok_or_else(|| {
-                            ParseError::ParseError("start_block underflow".to_string())
-                        })?;
-                    (start_block, end_block)
-                }
-                _ if second_ref.starts_with('+') => {
-                    let start_block =
-                        parse_block_number(first_ref, RangePosition::First, fetcher).await?;
-                    let end_block = start_block
-                        .checked_add(second_ref[1..].parse::<u64>().map_err(|_e| {
-                            ParseError::ParseError("start_block parse error".to_string())
-                        })?)
-                        .ok_or_else(|| ParseError::ParseError("end_block underflow".to_string()))?;
-                    (start_block, end_block)
-                }
-                _ => {
-                    let start_block =
-                        parse_block_number(first_ref, RangePosition::First, fetcher).await?;
-                    let end_block =
-                        parse_block_number(second_ref, RangePosition::Last, fetcher).await?;
-                    (start_block, end_block)
-                }
+            let parts: Vec<_> = second_ref.split('/').collect();
+            let (second_ref, n_keep) = if parts.len() == 2 {
+                let n_keep = parts[1].parse::<u32>().map_err(|_| {
+                    ParseError::ParseError("cannot parse block interval size".to_string())
+                })?;
+                (parts[0], Some(n_keep))
+            } else {
+                (*second_ref, None)
             };
 
-            if end_block <= start_block {
-                Err(ParseError::ParseError(
-                    "end_block should not be less than start_block".to_string(),
-                ))
-            } else if as_range {
-                Ok(BlockChunk::Range(start_block, end_block))
-            } else {
-                Ok(BlockChunk::Numbers((start_block..=end_block).collect()))
-            }
+            let (start_block, end_block) =
+                parse_block_range(first_ref, second_ref, fetcher).await?;
+            block_range_to_block_chunk(start_block, end_block, as_range, None, n_keep)
+        }
+        [first_ref, second_ref, third_ref] => {
+            let (start_block, end_block) =
+                parse_block_range(first_ref, second_ref, fetcher).await?;
+            let range_size = third_ref
+                .parse::<u32>()
+                .map_err(|_e| ParseError::ParseError("start_block parse error".to_string()))?;
+            block_range_to_block_chunk(start_block, end_block, false, Some(range_size), None)
         }
         _ => Err(ParseError::ParseError(
             "blocks must be in format block_number or start_block:end_block".to_string(),
         )),
     }
+}
+
+fn block_range_to_block_chunk(
+    start_block: u64,
+    end_block: u64,
+    as_range: bool,
+    skip: Option<u32>,
+    n_blocks: Option<u32>,
+) -> Result<BlockChunk, ParseError> {
+    if end_block < start_block {
+        Err(ParseError::ParseError("end_block should not be less than start_block".to_string()))
+    } else if let Some(n_blocks) = n_blocks {
+        let blocks = evenly_spaced_subset((start_block..=end_block).collect(), n_blocks as usize);
+        Ok(BlockChunk::Numbers(blocks))
+    } else if as_range {
+        Ok(BlockChunk::Range(start_block, end_block))
+    } else {
+        let blocks = match skip {
+            Some(skip) => (start_block..=end_block)
+                .enumerate()
+                .filter(|(idx, _)| idx % (skip as usize) == 0)
+                .map(|(_, value)| value)
+                .collect(),
+            None => match n_blocks {
+                Some(n_blocks) => {
+                    evenly_spaced_subset((start_block..=end_block).collect(), n_blocks as usize)
+                }
+                None => (start_block..=end_block).collect(),
+            },
+        };
+        Ok(BlockChunk::Numbers(blocks))
+    }
+}
+
+fn evenly_spaced_subset<T: Clone>(items: Vec<T>, subset_length: usize) -> Vec<T> {
+    if subset_length == 0 || items.is_empty() {
+        return Vec::new()
+    }
+
+    if subset_length >= items.len() {
+        return items.to_vec()
+    }
+
+    let original_length = items.len();
+    let interval = (original_length - 1) as f64 / (subset_length - 1) as f64;
+
+    let mut accumulator: f64 = 0.0;
+    let mut subset = Vec::with_capacity(subset_length);
+
+    for _ in 0..subset_length {
+        let index = accumulator.floor() as usize;
+        subset.push(items[index].clone());
+        accumulator += interval;
+    }
+
+    subset
+}
+
+async fn parse_block_range<P>(
+    first_ref: &str,
+    second_ref: &str,
+    fetcher: &Fetcher<P>,
+) -> Result<(u64, u64), ParseError>
+where
+    P: JsonRpcClient,
+{
+    let (start_block, end_block) = match (first_ref, second_ref) {
+        _ if first_ref.starts_with('-') => {
+            let end_block = parse_block_number(second_ref, RangePosition::Last, fetcher).await?;
+            let start_block =
+                end_block
+                    .checked_sub(first_ref[1..].parse::<u64>().map_err(|_e| {
+                        ParseError::ParseError("start_block parse error".to_string())
+                    })?)
+                    .ok_or_else(|| ParseError::ParseError("start_block underflow".to_string()))?;
+            (start_block, end_block)
+        }
+        _ if second_ref.starts_with('+') => {
+            let start_block = parse_block_number(first_ref, RangePosition::First, fetcher).await?;
+            let end_block =
+                start_block
+                    .checked_add(second_ref[1..].parse::<u64>().map_err(|_e| {
+                        ParseError::ParseError("start_block parse error".to_string())
+                    })?)
+                    .ok_or_else(|| ParseError::ParseError("end_block underflow".to_string()))?;
+            (start_block, end_block)
+        }
+        _ => {
+            let start_block = parse_block_number(first_ref, RangePosition::First, fetcher).await?;
+            let end_block = parse_block_number(second_ref, RangePosition::Last, fetcher).await?;
+            (start_block, end_block)
+        }
+    };
+
+    let end_block =
+        if second_ref != "latest" && !second_ref.is_empty() && !first_ref.starts_with('-') {
+            end_block - 1
+        } else {
+            end_block
+        };
+
+    let start_block = if first_ref.starts_with('-') { start_block + 1 } else { start_block };
+
+    Ok((start_block, end_block))
 }
 
 async fn parse_block_number<P: JsonRpcClient>(
@@ -359,7 +454,12 @@ mod tests {
                     assert_eq!(block_input_test_executor(inputs, expected, &fetcher).await, res);
                 }
                 BlockInputTest::WithoutMock((inputs, expected)) => {
-                    assert_eq!(block_input_test_executor(inputs, expected, &fetcher).await, res);
+                    println!("RES {:?}", res);
+                    println!("inputs {:?}", inputs);
+                    println!("EXPECTED {:?}", expected);
+                    let actual = block_input_test_executor(inputs, expected, &fetcher).await;
+                    println!("ACTUAL {:?}", actual);
+                    assert_eq!(actual, res);
                 }
             }
         }
@@ -374,6 +474,8 @@ mod tests {
         assert_eq!(block_chunks.len(), expected.len());
         for (i, block_chunk) in block_chunks.iter().enumerate() {
             let expected_chunk = &expected[i];
+            println!("BLOCK_CHUNK {:?}", block_chunk);
+            println!("EXCPECTED_CHUNK {:?}", expected_chunk);
             match expected_chunk {
                 BlockChunk::Numbers(expected_block_numbers) => {
                     assert!(matches!(block_chunk, BlockChunk::Numbers { .. }));
@@ -442,10 +544,10 @@ mod tests {
         // Ranges
         let tests: Vec<(BlockTokenTest<'_>, bool)> = vec![
             // Range Type
-            (BlockTokenTest::WithoutMock((r"1:2", BlockChunk::Range(1, 2))), true), /* Single block range */
-            (BlockTokenTest::WithoutMock((r"0:2", BlockChunk::Range(0, 2))), true), /* Implicit start */
-            (BlockTokenTest::WithoutMock((r"-10:100", BlockChunk::Range(90, 100))), true), /* Relative negative */
-            (BlockTokenTest::WithoutMock((r"10:+100", BlockChunk::Range(10, 110))), true), /* Relative positive */
+            (BlockTokenTest::WithoutMock((r"1:2", BlockChunk::Range(1, 1))), true), /* Single block range */
+            (BlockTokenTest::WithoutMock((r"0:2", BlockChunk::Range(0, 1))), true), /* Implicit start */
+            (BlockTokenTest::WithoutMock((r"-10:100", BlockChunk::Range(91, 100))), true), /* Relative negative */
+            (BlockTokenTest::WithoutMock((r"10:+100", BlockChunk::Range(10, 109))), true), /* Relative positive */
             (BlockTokenTest::WithMock((r"1:latest", BlockChunk::Range(1, 12), 12)), true), /* Explicit latest */
             (BlockTokenTest::WithMock((r"1:", BlockChunk::Range(1, 12), 12)), true), /* Implicit latest */
             // Number type
@@ -464,7 +566,7 @@ mod tests {
         let tests: Vec<(BlockInputTest<'_>, bool)> = vec![
             // Range Type
             (
-                BlockInputTest::WithoutMock((&block_inputs_single, vec![BlockChunk::Range(1, 2)])),
+                BlockInputTest::WithoutMock((&block_inputs_single, vec![BlockChunk::Range(1, 1)])),
                 true,
             ), // Single input
             (
@@ -486,9 +588,9 @@ mod tests {
                 BlockInputTest::WithoutMock((
                     &block_inputs_multiple_complex,
                     vec![
-                        BlockChunk::Numbers(vec![15000000, 15000001]),
-                        BlockChunk::Numbers(vec![1000, 1001, 1002]),
-                        BlockChunk::Numbers(vec![999999997, 999999998, 999999999, 1000000000]),
+                        BlockChunk::Numbers(vec![15000000]),
+                        BlockChunk::Numbers(vec![1000, 1001]),
+                        BlockChunk::Numbers(vec![999999998, 999999999, 1000000000]),
                         BlockChunk::Numbers(vec![2000]),
                     ],
                 )),

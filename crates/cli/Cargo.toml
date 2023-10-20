@@ -1,6 +1,5 @@
 [package]
 name = "cryo_cli"
-build = "build.rs"
 description = "cryo is the easiest way to extract blockchain data to parquet, csv, or json"
 version.workspace = true
 edition.workspace = true
@@ -22,17 +21,14 @@ path = "src/main.rs"
 cryo_freeze = { version = "0.2.0", path = "../freeze" }
 
 anstyle = { workspace = true }
-chrono = { workspace = true }
 clap_cryo = { workspace = true }
-colored = { workspace = true }
 color-print = { workspace = true }
+colored = { workspace = true }
 ethers = { workspace = true }
 eyre = { workspace = true }
 governor = { workspace = true }
 hex = { workspace = true }
-indicatif = { workspace = true }
 polars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thousands = { workspace = true }
 tokio = { workspace = true }

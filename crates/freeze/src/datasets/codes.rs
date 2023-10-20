@@ -1,160 +1,77 @@
-// required args:: address
-
-use crate::{types::Codes, ColumnType, Dataset, Datatype};
-use std::collections::HashMap;
-
+use crate::*;
 use ethers::prelude::*;
 use polars::prelude::*;
-use tokio::{sync::mpsc, task};
+use std::collections::HashMap;
 
-use crate::{
-    dataframes::SortableDataFrame,
-    types::{
-        conversions::ToVecHex, AddressChunk, BlockChunk, CollectError, RowFilter, Source, Table,
-    },
-    with_series, with_series_binary,
-};
-
-#[async_trait::async_trait]
-impl Dataset for Codes {
-    fn datatype(&self) -> Datatype {
-        Datatype::Codes
-    }
-
-    fn name(&self) -> &'static str {
-        "codes"
-    }
-
-    fn column_types(&self) -> HashMap<&'static str, ColumnType> {
-        HashMap::from_iter(vec![
-            ("block_number", ColumnType::UInt32),
-            ("address", ColumnType::Binary),
-            ("code", ColumnType::Binary),
-            ("chain_id", ColumnType::UInt64),
-        ])
-    }
-
-    fn default_columns(&self) -> Vec<&'static str> {
-        vec!["block_number", "address", "code"]
-    }
-
-    fn default_sort(&self) -> Vec<String> {
-        vec!["block_number".to_string(), "address".to_string()]
-    }
-
-    async fn collect_block_chunk(
-        &self,
-        chunk: &BlockChunk,
-        source: &Source,
-        schema: &Table,
-        filter: Option<&RowFilter>,
-    ) -> Result<DataFrame, CollectError> {
-        let address_chunks = match filter {
-            Some(filter) => match &filter.address_chunks {
-                Some(address_chunks) => address_chunks.clone(),
-                _ => return Err(CollectError::CollectError("must specify addresses".to_string())),
-            },
-            _ => return Err(CollectError::CollectError("must specify addresses".to_string())),
-        };
-        let rx = fetch_codes(vec![chunk], address_chunks, source).await;
-        codes_to_df(rx, schema, source.chain_id).await
-    }
-}
-
-pub(crate) type BlockAddressCode = (u64, Vec<u8>, Vec<u8>);
-
-async fn fetch_codes(
-    block_chunks: Vec<&BlockChunk>,
-    address_chunks: Vec<AddressChunk>,
-    source: &Source,
-) -> mpsc::Receiver<Result<BlockAddressCode, CollectError>> {
-    let (tx, rx) = mpsc::channel(100);
-
-    for block_chunk in block_chunks {
-        for number in block_chunk.numbers() {
-            for address_chunk in &address_chunks {
-                for address in address_chunk.values().iter() {
-                    let address = address.clone();
-                    let address_h160 = H160::from_slice(&address);
-                    let tx = tx.clone();
-                    let source = source.clone();
-                    task::spawn(async move {
-                        let result = source.fetcher.get_code(address_h160, number.into()).await;
-                        let result = match result {
-                            Ok(value) => Ok((number, address, value.to_vec())),
-                            Err(e) => Err(e),
-                        };
-                        match tx.send(result).await {
-                            Ok(_) => {}
-                            Err(tokio::sync::mpsc::error::SendError(_e)) => {
-                                eprintln!("send error, try using a rate limit with --requests-per-second or limiting max concurrency with --max-concurrent-requests");
-                                std::process::exit(1)
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    }
-
-    rx
-}
-
-async fn codes_to_df(
-    mut stream: mpsc::Receiver<Result<BlockAddressCode, CollectError>>,
-    schema: &Table,
-    chain_id: u64,
-) -> Result<DataFrame, CollectError> {
-    // initialize
-    let mut columns = CodeColumns::default();
-
-    // parse stream of blocks
-    while let Some(message) = stream.recv().await {
-        match message {
-            Ok(block_address_code) => {
-                columns.process_code(block_address_code, schema);
-            }
-            Err(e) => {
-                println!("{:?}", e);
-                return Err(CollectError::TooManyRequestsError)
-            }
-        }
-    }
-
-    // convert to dataframes
-    columns.create_df(schema, chain_id)
-}
-
+/// columns for balances
+#[cryo_to_df::to_df(Datatype::Codes)]
 #[derive(Default)]
-struct CodeColumns {
+pub struct Codes {
     n_rows: usize,
     block_number: Vec<u32>,
     address: Vec<Vec<u8>>,
     code: Vec<Vec<u8>>,
+    chain_id: Vec<u64>,
 }
 
-impl CodeColumns {
-    fn process_code(&mut self, block_address_code: BlockAddressCode, schema: &Table) {
-        let (block, address, code) = block_address_code;
-        self.n_rows += 1;
-        if schema.has_column("block_number") {
-            self.block_number.push(block as u32);
-        }
-        if schema.has_column("address") {
-            self.address.push(address);
-        }
-        if schema.has_column("code") {
-            self.code.push(code);
-        }
+#[async_trait::async_trait]
+impl Dataset for Codes {
+    fn name() -> &'static str {
+        "codes"
     }
 
-    fn create_df(self, schema: &Table, chain_id: u64) -> Result<DataFrame, CollectError> {
-        let mut cols = Vec::with_capacity(schema.columns().len());
-        with_series!(cols, "block_number", self.block_number, schema);
-        with_series_binary!(cols, "address", self.address, schema);
-        with_series_binary!(cols, "code", self.code, schema);
-        with_series!(cols, "chain_id", vec![chain_id; self.n_rows], schema);
-
-        DataFrame::new(cols).map_err(CollectError::PolarsError).sort_by_schema(schema)
+    fn default_sort() -> Vec<String> {
+        vec!["block_number".to_string(), "address".to_string()]
     }
+
+    fn required_parameters() -> Vec<Dim> {
+        vec![Dim::Address]
+    }
+
+    fn arg_aliases() -> Option<HashMap<Dim, Dim>> {
+        Some([(Dim::Contract, Dim::Address)].into_iter().collect())
+    }
+
+    fn default_blocks() -> Option<String> {
+        Some("latest".to_string())
+    }
+}
+
+type Result<T> = ::core::result::Result<T, CollectError>;
+type BlockTxAddressOutput = (u32, Option<Vec<u8>>, Vec<u8>, Vec<u8>);
+
+#[async_trait::async_trait]
+impl CollectByBlock for Codes {
+    type Response = BlockTxAddressOutput;
+
+    async fn extract(
+        request: Params,
+        source: Arc<Source>,
+        _schemas: Schemas,
+    ) -> Result<Self::Response> {
+        let address = request.address()?;
+        let block_number = request.block_number()? as u32;
+        let output =
+            source.fetcher.get_code(H160::from_slice(&address), block_number.into()).await?;
+        Ok((block_number, None, address, output.to_vec()))
+    }
+
+    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
+        let schema = schemas.get(&Datatype::Codes).ok_or(err("schema not provided"))?;
+        process_nonce(columns, response, schema)
+    }
+}
+
+#[async_trait::async_trait]
+impl CollectByTransaction for Codes {
+    type Response = ();
+}
+
+fn process_nonce(columns: &mut Codes, data: BlockTxAddressOutput, schema: &Table) -> Result<()> {
+    let (block, _tx, address, output) = data;
+    columns.n_rows += 1;
+    store!(schema, columns, block_number, block);
+    store!(schema, columns, address, address);
+    store!(schema, columns, code, output);
+    Ok(())
 }

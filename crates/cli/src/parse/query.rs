@@ -1,159 +1,111 @@
-use std::{collections::HashMap, sync::Arc};
-
-use ethers::prelude::*;
-use hex::FromHex;
-
-use cryo_freeze::{
-    AddressChunk, CallDataChunk, Datatype, Fetcher, MultiQuery, ParseError, RowFilter, SlotChunk,
-};
-
-use super::{
-    blocks, parse_schemas,
-    parse_utils::{hex_string_to_binary, hex_strings_to_binary, parse_binary_arg},
-    transactions,
-};
+use super::{parse_schemas, partitions};
 use crate::args::Args;
+use cryo_freeze::{Dim, Fetcher, ParseError, Query, QueryLabels, Schemas};
+use ethers::prelude::*;
+use std::sync::Arc;
 
 pub(crate) async fn parse_query<P: JsonRpcClient>(
     args: &Args,
     fetcher: Arc<Fetcher<P>>,
-) -> Result<MultiQuery, ParseError> {
-    // process schemas
+) -> Result<Query, ParseError> {
     let schemas = parse_schemas(args)?;
 
-    // process chunks
-    let chunks = match (&args.blocks, &args.txs) {
-        (Some(_), None) => blocks::parse_blocks(args, fetcher).await?,
-        (None, Some(txs)) => transactions::parse_transactions(txs)?,
-        (None, None) => blocks::get_default_block_chunks(args, fetcher, &schemas).await?,
-        (Some(_), Some(_)) => {
-            return Err(ParseError::ParseError("specify only one of --blocks or --txs".to_string()))
-        }
-    };
+    let arg_aliases = find_arg_aliases(args, &schemas);
+    let new_args =
+        if !arg_aliases.is_empty() { Some(apply_arg_aliases(args, arg_aliases)?) } else { None };
+    let args = new_args.as_ref().unwrap_or(args);
 
-    // deprecated
-    let address = if let Some(contract) = &args.contract {
-        parse_address(&Some(contract[0].clone()))
-    } else {
-        None
-    };
-
-    // build row filters
-    let call_data_chunks = parse_call_datas(&args.call_data, &args.function, &args.inputs)?;
-    let address_chunks = parse_address_chunks(&args.address, "address")?;
-    let contract_chunks = parse_address_chunks(&args.contract, "contract_address")?;
-    let to_address_chunks = parse_address_chunks(&args.to_address, "to_address")?;
-    let slot_chunks = parse_slot_chunks(&args.slots, "slot")?;
-    let topics = [
-        parse_topic(&args.topic0),
-        parse_topic(&args.topic1),
-        parse_topic(&args.topic2),
-        parse_topic(&args.topic3),
-    ];
-    let row_filter = RowFilter {
-        address,
-        topics,
-        address_chunks,
-        contract_chunks,
-        to_address_chunks,
-        slot_chunks,
-        call_data_chunks,
-    };
-    let mut row_filters: HashMap<Datatype, RowFilter> = HashMap::new();
-    for datatype in schemas.keys() {
-        let row_filter = row_filter.apply_arg_aliases(datatype.dataset().arg_aliases());
-        row_filters.insert(*datatype, row_filter);
-    }
-
-    let query = MultiQuery { schemas, chunks, row_filters };
-    Ok(query)
+    let (partitions, partitioned_by, time_dimension) =
+        partitions::parse_partitions(args, fetcher, &schemas).await?;
+    let datatypes = cryo_freeze::cluster_datatypes(schemas.keys().cloned().collect());
+    let labels = QueryLabels { align: args.align, reorg_buffer: args.reorg_buffer };
+    Ok(Query { datatypes, schemas, time_dimension, partitions, partitioned_by, labels })
 }
 
-fn parse_call_datas(
-    call_datas: &Option<Vec<String>>,
-    function: &Option<Vec<String>>,
-    inputs: &Option<Vec<String>>,
-) -> Result<Option<Vec<CallDataChunk>>, ParseError> {
-    let call_datas = match (call_datas, function, inputs) {
-        (None, None, None) => return Ok(None),
-        (Some(call_data), None, None) => hex_strings_to_binary(call_data)?,
-        (None, Some(function), None) => hex_strings_to_binary(function)?,
-        (None, Some(function), Some(inputs)) => {
-            let mut call_datas = Vec::new();
-            for f in function.iter() {
-                for i in inputs.iter() {
-                    let mut call_data = hex_string_to_binary(f)?.clone();
-                    call_data.extend(hex_string_to_binary(i)?);
-                    call_datas.push(call_data);
+fn find_arg_aliases(args: &Args, schemas: &Schemas) -> Vec<(Dim, Dim)> {
+    // does not currently handle optional args, just required args
+    let mut swaps = Vec::new();
+    for datatype in schemas.keys() {
+        let aliases = datatype.arg_aliases();
+        if aliases.is_empty() {
+            continue
+        }
+        for dim in datatype.required_parameters() {
+            if args.dim_is_none(&dim) {
+                for (k, v) in aliases.iter() {
+                    if v == &dim && args.dim_is_some(k) {
+                        swaps.push((*k, *v));
+                    }
                 }
             }
-            call_datas
         }
-        (None, None, Some(_)) => {
-            let message = "must specify function if specifying inputs";
-            return Err(ParseError::ParseError(message.to_string()))
-        }
-        (Some(_), Some(_), None) => {
-            let message = "cannot specify both call_data and function";
-            return Err(ParseError::ParseError(message.to_string()))
-        }
-        (Some(_), None, Some(_)) => {
-            let message = "cannot specify both call_data and inputs";
-            return Err(ParseError::ParseError(message.to_string()))
-        }
-        (Some(_), Some(_), Some(_)) => {
-            let message = "cannot specify both call_data and function";
-            return Err(ParseError::ParseError(message.to_string()))
-        }
-    };
-    Ok(Some(vec![CallDataChunk::Values(call_datas)]))
+    }
+    swaps
 }
 
-pub(crate) fn parse_address_chunks(
-    address: &Option<Vec<String>>,
-    default_column: &str,
-) -> Result<Option<Vec<AddressChunk>>, ParseError> {
-    if let Some(address) = address {
-        let chunks = parse_binary_arg(address, default_column)?
-            .values()
-            .map(|a| AddressChunk::Values(a.clone()))
-            .collect();
-        Ok(Some(chunks))
-    } else {
-        Ok(None)
+trait DimIsNone {
+    fn dim_is_some(&self, dim: &Dim) -> bool;
+    fn dim_is_none(&self, dim: &Dim) -> bool;
+}
+
+impl DimIsNone for Args {
+    fn dim_is_some(&self, dim: &Dim) -> bool {
+        match dim {
+            Dim::BlockNumber => self.blocks.is_some(),
+            Dim::TransactionHash => self.txs.is_some(),
+            Dim::Address => self.address.is_some(),
+            Dim::ToAddress => self.to_address.is_some(),
+            Dim::Contract => self.contract.is_some(),
+            Dim::CallData => self.call_data.is_some(),
+            Dim::Slot => self.slot.is_some(),
+            Dim::Topic0 => self.topic0.is_some(),
+            Dim::Topic1 => self.topic1.is_some(),
+            Dim::Topic2 => self.topic2.is_some(),
+            Dim::Topic3 => self.topic3.is_some(),
+        }
+    }
+
+    fn dim_is_none(&self, dim: &Dim) -> bool {
+        match dim {
+            Dim::BlockNumber => self.blocks.is_none(),
+            Dim::TransactionHash => self.txs.is_none(),
+            Dim::Address => self.address.is_none(),
+            Dim::ToAddress => self.to_address.is_none(),
+            Dim::Contract => self.contract.is_none(),
+            Dim::CallData => self.call_data.is_none(),
+            Dim::Slot => self.slot.is_none(),
+            Dim::Topic0 => self.topic0.is_none(),
+            Dim::Topic1 => self.topic1.is_none(),
+            Dim::Topic2 => self.topic2.is_none(),
+            Dim::Topic3 => self.topic3.is_none(),
+        }
     }
 }
 
-pub(crate) fn parse_slot_chunks(
-    slots: &Option<Vec<String>>,
-    default_column: &str,
-) -> Result<Option<Vec<SlotChunk>>, ParseError> {
-    if let Some(values) = slots {
-        let chunks = parse_binary_arg(values, default_column)?
-            .values()
-            .map(|a| SlotChunk::Values(a.clone()))
-            .collect();
-        Ok(Some(chunks))
-    } else {
-        Ok(None)
+fn apply_arg_aliases(args: &Args, arg_aliases: Vec<(Dim, Dim)>) -> Result<Args, ParseError> {
+    let mut args = (*args).clone();
+    for (k, v) in arg_aliases.iter() {
+        args = match (k, v) {
+            (Dim::Contract, Dim::Address) => {
+                Args { address: args.contract.clone(), contract: None, ..args }
+            }
+            (Dim::ToAddress, Dim::Address) => {
+                Args { address: args.to_address.clone(), to_address: None, ..args }
+            }
+            (Dim::Address, Dim::Contract) => {
+                Args { contract: args.address.clone(), address: None, ..args }
+            }
+            (Dim::ToAddress, Dim::Contract) => {
+                Args { contract: args.to_address.clone(), to_address: None, ..args }
+            }
+            (Dim::Address, Dim::ToAddress) => {
+                Args { to_address: args.address.clone(), address: None, ..args }
+            }
+            (Dim::Contract, Dim::ToAddress) => {
+                Args { to_address: args.contract.clone(), contract: None, ..args }
+            }
+            _ => return Err(ParseError::ParseError("invalid arg alias pairing".to_string())),
+        };
     }
-}
-
-fn parse_address(input: &Option<String>) -> Option<ValueOrArray<H160>> {
-    input.as_ref().and_then(|data| {
-        <[u8; 20]>::from_hex(data.as_str().chars().skip(2).collect::<String>().as_str())
-            .ok()
-            .map(H160)
-            .map(ValueOrArray::Value)
-    })
-}
-
-fn parse_topic(input: &Option<String>) -> Option<ValueOrArray<Option<H256>>> {
-    let value = input.as_ref().and_then(|data| {
-        <[u8; 32]>::from_hex(data.as_str().chars().skip(2).collect::<String>().as_str())
-            .ok()
-            .map(H256)
-    });
-
-    value.map(|inner| ValueOrArray::Value(Some(inner)))
+    Ok(args)
 }
