@@ -1,7 +1,6 @@
 use super::erc20_metadata::remove_control_characters;
 use crate::*;
 use polars::prelude::*;
-use std::collections::HashMap;
 
 /// columns for transactions
 #[cryo_to_df::to_df(Datatype::Erc721Metadata)]
@@ -16,36 +15,24 @@ pub struct Erc721Metadata {
 }
 
 impl Dataset for Erc721Metadata {
-    fn name() -> &'static str {
-        "erc721_metadata"
-    }
-
-    fn default_sort() -> Vec<String> {
-        vec!["symbol".to_string(), "block_number".to_string()]
+    fn default_sort() -> Option<Vec<&'static str>> {
+        Some(vec!["symbol", "block_number"])
     }
 
     fn required_parameters() -> Vec<Dim> {
         vec![Dim::Address]
     }
 
-    fn arg_aliases() -> Option<HashMap<Dim, Dim>> {
+    fn arg_aliases() -> Option<std::collections::HashMap<Dim, Dim>> {
         Some([(Dim::Contract, Dim::Address)].into_iter().collect())
     }
 }
 
-type Result<T> = ::core::result::Result<T, CollectError>;
-
-type BlockAddressNameSymbol = (u32, Vec<u8>, Option<String>, Option<String>);
-
 #[async_trait::async_trait]
 impl CollectByBlock for Erc721Metadata {
-    type Response = BlockAddressNameSymbol;
+    type Response = (u32, Vec<u8>, Option<String>, Option<String>);
 
-    async fn extract(
-        request: Params,
-        source: Arc<Source>,
-        _schemas: Schemas,
-    ) -> Result<Self::Response> {
+    async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
         let block_number = request.ethers_block_number()?;
         let address = request.ethers_address()?;
 
@@ -62,8 +49,8 @@ impl CollectByBlock for Erc721Metadata {
         Ok((request.block_number()? as u32, request.address()?, name, symbol))
     }
 
-    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
-        let schema = schemas.get(&Datatype::Erc721Metadata).ok_or(err("schema not provided"))?;
+    fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
+        let schema = query.schemas.get_schema(&Datatype::Erc721Metadata)?;
         let (block, address, name, symbol) = response;
         columns.n_rows += 1;
         store!(schema, columns, block_number, block);

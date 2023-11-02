@@ -1,6 +1,5 @@
 use crate::*;
 use polars::prelude::*;
-use std::collections::HashMap;
 
 /// columns for transactions
 #[cryo_to_df::to_df(Datatype::Erc20Metadata)]
@@ -17,12 +16,8 @@ pub struct Erc20Metadata {
 
 #[async_trait::async_trait]
 impl Dataset for Erc20Metadata {
-    fn name() -> &'static str {
-        "erc20_metadata"
-    }
-
-    fn default_sort() -> Vec<String> {
-        vec!["symbol".to_string(), "block_number".to_string()]
+    fn default_sort() -> Option<Vec<&'static str>> {
+        Some(vec!["symbol", "block_number"])
     }
 
     fn default_blocks() -> Option<String> {
@@ -33,13 +28,10 @@ impl Dataset for Erc20Metadata {
         vec![Dim::Address]
     }
 
-    fn arg_aliases() -> Option<HashMap<Dim, Dim>> {
+    fn arg_aliases() -> Option<std::collections::HashMap<Dim, Dim>> {
         Some([(Dim::Contract, Dim::Address)].into_iter().collect())
     }
 }
-
-type Result<T> = ::core::result::Result<T, CollectError>;
-type BlockAddressNameSymbolDecimals = (u32, Vec<u8>, Option<String>, Option<String>, Option<u32>);
 
 pub(crate) fn remove_control_characters(s: &str) -> String {
     let re = regex::Regex::new(r"[ \x00-\x1F\x7F]").unwrap();
@@ -48,13 +40,9 @@ pub(crate) fn remove_control_characters(s: &str) -> String {
 
 #[async_trait::async_trait]
 impl CollectByBlock for Erc20Metadata {
-    type Response = BlockAddressNameSymbolDecimals;
+    type Response = (u32, Vec<u8>, Option<String>, Option<String>, Option<u32>);
 
-    async fn extract(
-        request: Params,
-        source: Arc<Source>,
-        _schemas: Schemas,
-    ) -> Result<Self::Response> {
+    async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
         let block_number = request.ethers_block_number()?;
         let address = request.ethers_address()?;
 
@@ -76,8 +64,8 @@ impl CollectByBlock for Erc20Metadata {
         Ok((request.block_number()? as u32, request.address()?, name, symbol, decimals))
     }
 
-    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
-        let schema = schemas.get(&Datatype::Erc20Metadata).ok_or(err("schema not provided"))?;
+    fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
+        let schema = query.schemas.get_schema(&Datatype::Erc20Metadata)?;
         let (block, address, name, symbol, decimals) = response;
         columns.n_rows += 1;
         store!(schema, columns, block_number, block);

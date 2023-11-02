@@ -1,7 +1,6 @@
 use crate::*;
 use ethers::prelude::*;
 use polars::prelude::*;
-use std::collections::HashMap;
 
 /// columns for transactions
 #[cryo_to_df::to_df(Datatype::NativeTransfers)]
@@ -19,33 +18,20 @@ pub struct NativeTransfers {
 }
 
 #[async_trait::async_trait]
-impl Dataset for NativeTransfers {
-    fn name() -> &'static str {
-        "native_transfers"
-    }
-
-    fn default_sort() -> Vec<String> {
-        vec!["block_number".to_string(), "transfer_index".to_string()]
-    }
-}
-
-type Result<T> = ::core::result::Result<T, CollectError>;
+impl Dataset for NativeTransfers {}
 
 #[async_trait::async_trait]
 impl CollectByBlock for NativeTransfers {
     type Response = Vec<Trace>;
 
-    async fn extract(
-        request: Params,
-        source: Arc<Source>,
-        _schemas: Schemas,
-    ) -> Result<Self::Response> {
+    async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
         source.fetcher.trace_block(request.block_number()?.into()).await
     }
 
-    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
-        let traces = traces::filter_failed_traces(response);
-        process_native_transfers(&traces, columns, schemas)
+    fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
+        let traces =
+            if query.exclude_failed { traces::filter_failed_traces(response) } else { response };
+        process_native_transfers(&traces, columns, &query.schemas)
     }
 }
 
@@ -53,17 +39,14 @@ impl CollectByBlock for NativeTransfers {
 impl CollectByTransaction for NativeTransfers {
     type Response = Vec<Trace>;
 
-    async fn extract(
-        request: Params,
-        source: Arc<Source>,
-        _schemas: Schemas,
-    ) -> Result<Self::Response> {
+    async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
         source.fetcher.trace_transaction(request.ethers_transaction_hash()?).await
     }
 
-    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
-        let traces = traces::filter_failed_traces(response);
-        process_native_transfers(&traces, columns, schemas)
+    fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
+        let traces =
+            if query.exclude_failed { traces::filter_failed_traces(response) } else { response };
+        process_native_transfers(&traces, columns, &query.schemas)
     }
 }
 
@@ -72,7 +55,7 @@ pub(crate) fn process_native_transfers(
     traces: &[Trace],
     columns: &mut NativeTransfers,
     schemas: &Schemas,
-) -> Result<()> {
+) -> R<()> {
     let schema = schemas.get(&Datatype::NativeTransfers).ok_or(err("schema not provided"))?;
     for (transfer_index, trace) in traces.iter().enumerate() {
         columns.n_rows += 1;

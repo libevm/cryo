@@ -7,7 +7,9 @@ target
 *.parquet_tmp
 *.json
 *.json_tmp
+*._tmp
 TODO.md
 graveyard
 .idea
 flamegraph.svg
+test.sh

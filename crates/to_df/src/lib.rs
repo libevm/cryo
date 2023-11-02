@@ -39,6 +39,9 @@ pub fn to_df(attrs: TokenStream, input: TokenStream) -> TokenStream {
         .map(|(name, ty)| {
             let macro_name = match quote!(#ty).to_string().as_str() {
                 "Vec < Vec < u8 > >" => syn::Ident::new("with_series_binary", Span::call_site()),
+                "Vec < Option < Vec < u8 > > >" => {
+                    syn::Ident::new("with_series_binary", Span::call_site())
+                }
                 "Vec < U256 >" => syn::Ident::new("with_series_u256", Span::call_site()),
                 "Vec < Option < U256 > >" => {
                     syn::Ident::new("with_series_option_u256", Span::call_site())
@@ -54,6 +57,7 @@ pub fn to_df(attrs: TokenStream, input: TokenStream) -> TokenStream {
 
     fn map_type_to_column_type(ty: &syn::Type) -> Option<proc_macro2::TokenStream> {
         match quote!(#ty).to_string().as_str() {
+            "Vec < bool >" => Some(quote! { ColumnType::Boolean }),
             "Vec < u32 >" => Some(quote! { ColumnType::UInt32 }),
             "Vec < u64 >" => Some(quote! { ColumnType::UInt64 }),
             "Vec < U256 >" => Some(quote! { ColumnType::UInt256 }),
@@ -64,6 +68,7 @@ pub fn to_df(attrs: TokenStream, input: TokenStream) -> TokenStream {
             "Vec < String >" => Some(quote! { ColumnType::String }),
             "Vec < Vec < u8 > >" => Some(quote! { ColumnType::Binary }),
 
+            "Vec < Option < bool > >" => Some(quote! { ColumnType::Boolean }),
             "Vec < Option < u32 > >" => Some(quote! { ColumnType::UInt32 }),
             "Vec < Option < u64 > >" => Some(quote! { ColumnType::UInt64 }),
             "Vec < Option < U256 > >" => Some(quote! { ColumnType::UInt256 }),
@@ -99,9 +104,9 @@ pub fn to_df(attrs: TokenStream, input: TokenStream) -> TokenStream {
 
             fn create_dfs(
                 self,
-                schemas: &HashMap<Datatype, Table>,
+                schemas: &std::collections::HashMap<Datatype, Table>,
                 chain_id: u64,
-            ) -> Result<HashMap<Datatype, DataFrame>> {
+            ) -> R<std::collections::HashMap<Datatype, DataFrame>> {
                 let datatypes = vec![#(#datatypes),*];
                 let datatype = if datatypes.len() == 1 {
                     datatypes[0]
@@ -120,7 +125,7 @@ pub fn to_df(attrs: TokenStream, input: TokenStream) -> TokenStream {
                 }
 
                 let df = DataFrame::new(cols).map_err(CollectError::PolarsError).sort_by_schema(schema)?;
-                let mut output = HashMap::new();
+                let mut output = std::collections::HashMap::new();
                 output.insert(datatype, df);
                 Ok(output)
             }
@@ -128,8 +133,8 @@ pub fn to_df(attrs: TokenStream, input: TokenStream) -> TokenStream {
 
         impl ColumnData for #name {
 
-            fn column_types() -> HashMap<&'static str, ColumnType> {
-                HashMap::from_iter(vec![
+            fn column_types() -> std::collections::HashMap<&'static str, ColumnType> {
+                std::collections::HashMap::from_iter(vec![
                     #(#column_types),*
                 ])
             }

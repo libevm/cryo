@@ -2,7 +2,6 @@ use super::traces;
 use crate::*;
 use ethers::prelude::*;
 use polars::prelude::*;
-use std::collections::HashMap;
 
 /// columns for transactions
 #[cryo_to_df::to_df(Datatype::TraceCalls)]
@@ -33,14 +32,6 @@ pub struct TraceCalls {
 }
 
 impl Dataset for TraceCalls {
-    fn name() -> &'static str {
-        "trace_calls"
-    }
-
-    fn default_sort() -> Vec<String> {
-        vec!["block_number".to_string(), "transaction_index".to_string()]
-    }
-
     fn default_blocks() -> Option<String> {
         Some("latest".to_string())
     }
@@ -49,23 +40,16 @@ impl Dataset for TraceCalls {
         vec![Dim::Contract, Dim::CallData]
     }
 
-    fn arg_aliases() -> Option<HashMap<Dim, Dim>> {
+    fn arg_aliases() -> Option<std::collections::HashMap<Dim, Dim>> {
         Some([(Dim::Address, Dim::Contract), (Dim::ToAddress, Dim::Contract)].into_iter().collect())
     }
 }
 
-type Result<T> = ::core::result::Result<T, CollectError>;
-type ContractCallDataTraces = (u32, Vec<u8>, Vec<u8>, Vec<TransactionTrace>);
-
 #[async_trait::async_trait]
 impl CollectByBlock for TraceCalls {
-    type Response = ContractCallDataTraces;
+    type Response = (u32, Vec<u8>, Vec<u8>, Vec<TransactionTrace>);
 
-    async fn extract(
-        request: Params,
-        source: Arc<Source>,
-        _schemas: Schemas,
-    ) -> Result<Self::Response> {
+    async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
         let traces: Vec<TransactionTrace> = source
             .fetcher
             .trace_call2(
@@ -80,8 +64,8 @@ impl CollectByBlock for TraceCalls {
         Ok((request.block_number()? as u32, request.contract()?, request.call_data()?, traces))
     }
 
-    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
-        let schema = schemas.get(&Datatype::TraceCalls).ok_or(err("schema not provided"))?;
+    fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
+        let schema = query.schemas.get_schema(&Datatype::TraceCalls)?;
         process_transaction_traces(response, columns, schema);
         Ok(())
     }
@@ -92,7 +76,7 @@ impl CollectByTransaction for TraceCalls {
 }
 
 fn process_transaction_traces(
-    response: ContractCallDataTraces,
+    response: (u32, Vec<u8>, Vec<u8>, Vec<TransactionTrace>),
     columns: &mut TraceCalls,
     schema: &Table,
 ) {

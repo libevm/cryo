@@ -3,7 +3,6 @@ use crate::*;
 use ethers::prelude::*;
 use ethers_core::utils::keccak256;
 use polars::prelude::*;
-use std::collections::HashMap;
 
 /// columns for transactions
 #[cryo_to_df::to_df(Datatype::Contracts)]
@@ -25,32 +24,23 @@ pub struct Contracts {
 
 #[async_trait::async_trait]
 impl Dataset for Contracts {
-    fn name() -> &'static str {
-        "contracts"
-    }
-
-    fn default_sort() -> Vec<String> {
-        vec!["block_number".to_string(), "create_index".to_string()]
+    fn default_sort() -> Option<Vec<&'static str>> {
+        Some(vec!["block_number", "create_index"])
     }
 }
-
-type Result<T> = ::core::result::Result<T, CollectError>;
 
 #[async_trait::async_trait]
 impl CollectByBlock for Contracts {
     type Response = Vec<Trace>;
 
-    async fn extract(
-        request: Params,
-        source: Arc<Source>,
-        _schemas: Schemas,
-    ) -> Result<Self::Response> {
+    async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
         source.fetcher.trace_block(request.ethers_block_number()?).await
     }
 
-    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
-        let traces = traces::filter_failed_traces(response);
-        process_contracts(&traces, columns, schemas)
+    fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
+        let traces =
+            if query.exclude_failed { traces::filter_failed_traces(response) } else { response };
+        process_contracts(&traces, columns, &query.schemas)
     }
 }
 
@@ -58,17 +48,14 @@ impl CollectByBlock for Contracts {
 impl CollectByTransaction for Contracts {
     type Response = Vec<Trace>;
 
-    async fn extract(
-        request: Params,
-        source: Arc<Source>,
-        _schemas: Schemas,
-    ) -> Result<Self::Response> {
+    async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
         source.fetcher.trace_transaction(request.ethers_transaction_hash()?).await
     }
 
-    fn transform(response: Self::Response, columns: &mut Self, schemas: &Schemas) -> Result<()> {
-        let traces = traces::filter_failed_traces(response);
-        process_contracts(&traces, columns, schemas)
+    fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
+        let traces =
+            if query.exclude_failed { traces::filter_failed_traces(response) } else { response };
+        process_contracts(&traces, columns, &query.schemas)
     }
 }
 
@@ -77,7 +64,7 @@ pub(crate) fn process_contracts(
     traces: &[Trace],
     columns: &mut Contracts,
     schemas: &Schemas,
-) -> Result<()> {
+) -> R<()> {
     let schema = schemas.get(&Datatype::Contracts).ok_or(err("schema not provided"))?;
     let mut deployer = H160([0; 20]);
     let mut create_index = 0;

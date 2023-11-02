@@ -21,6 +21,7 @@ use cryo_freeze::collect;
         u256_types = None,
         hex = false,
         sort = None,
+        exclude_failed = false,
         rpc = None,
         network_name = None,
         requests_per_second = None,
@@ -78,6 +79,7 @@ pub fn _collect(
     u256_types: Option<Vec<String>>,
     hex: bool,
     sort: Option<Vec<String>>,
+    exclude_failed: bool,
     rpc: Option<String>,
     network_name: Option<String>,
     requests_per_second: Option<u32>,
@@ -139,6 +141,7 @@ pub fn _collect(
             u256_types,
             hex,
             sort,
+            exclude_failed,
             rpc,
             network_name,
             requests_per_second,
@@ -196,7 +199,7 @@ async fn run_collect(args: Args) -> PolarsResult<DataFrame> {
         Ok(opts) => opts,
         Err(e) => panic!("error parsing opts {:?}", e),
     };
-    match collect(query, source.into()).await {
+    match collect(query.into(), source.into()).await {
         Ok(df) => Ok(df),
         Err(e) => panic!("error collecting {:?}", e),
     }
